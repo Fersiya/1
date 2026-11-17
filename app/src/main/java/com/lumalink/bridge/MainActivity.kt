@@ -69,7 +69,12 @@ class MainActivity : AppCompatActivity() {
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { perms ->
-        if (perms.values.all { it }) {
+        // Уведомления нужны только для значка сервиса — отказ от них не должен блокировать запуск.
+        val bluetoothGranted = perms
+            .filterKeys { it != Manifest.permission.POST_NOTIFICATIONS }
+            .values
+            .all { it }
+        if (bluetoothGranted) {
             val mac = pendingAutoConnectMac
             pendingAutoConnectMac = null
             if (mac != null) {

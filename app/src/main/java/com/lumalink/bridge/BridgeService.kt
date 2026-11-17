@@ -48,7 +48,7 @@ class BridgeService : Service() {
         val liveColorFlow = MutableStateFlow(Color.parseColor("#1E293B"))
     }
 
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var wakeLock: PowerManager.WakeLock? = null
     private var okHttpClient: OkHttpClient? = null
     private var webSocket: WebSocket? = null
@@ -83,6 +83,12 @@ class BridgeService : Service() {
 
         val pcIp = intent?.getStringExtra(EXTRA_IP) ?: return START_NOT_STICKY
         val bleMac = intent?.getStringExtra(EXTRA_MAC) ?: return START_NOT_STICKY
+
+        // После stopBridge() scope отменён, а сервис мог остаться тем же экземпляром — пересоздаём.
+        if (!scope.isActive) {
+            scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        }
+        while (writeQueue.tryReceive().isSuccess) { /* сбрасываем устаревшие пакеты */ }
 
         stopping = false
         bleConnectedOnce = false
