@@ -25,6 +25,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import okhttp3.*
 import okio.ByteString
 import okio.ByteString.Companion.toByteString
+import org.json.JSONArray
 import org.json.JSONObject
 import java.util.UUID
 
@@ -56,6 +57,7 @@ class BridgeService : Service() {
 
     private val writeQueue = Channel<ByteArray>(capacity = 16, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     private var writeAck: CompletableDeferred<Int>? = null
+    private var readAck: CompletableDeferred<ByteArray?>? = null
 
     @Volatile
     private var stopping = false
@@ -67,6 +69,7 @@ class BridgeService : Service() {
     private var negotiatedMtu = 23
 
     private var targetMac: String = ""
+    private var lastAdvHex: String = ""
     private var connectAttempt = 0
     private val maxConnectAttempts = 3
 
@@ -85,6 +88,7 @@ class BridgeService : Service() {
         bleConnectedOnce = false
         negotiatedMtu = 23
         targetMac = bleMac
+        lastAdvHex = ""
         connectAttempt = 0
 
         startForegroundServiceNotification()
@@ -95,6 +99,8 @@ class BridgeService : Service() {
         connectWebSocket(pcIp, bleMac)
         return START_STICKY
     }
+
+    private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 
     private fun startForegroundServiceNotification() {
         val channelId = "lumalink_bridge_channel"
@@ -196,6 +202,10 @@ class BridgeService : Service() {
             val cb = object : ScanCallback() {
                 override fun onScanResult(callbackType: Int, result: ScanResult) {
                     if (result.device.address.equals(mac, ignoreCase = true)) {
+                        val rawAdv = result.scanRecord?.bytes
+                        if (rawAdv != null) {
+                            lastAdvHex = rawAdv.toHex()
+                        }
                         foundSignal.complete(true)
                     }
                 }
@@ -294,10 +304,25 @@ class BridgeService : Service() {
 
             var foundNotify: BluetoothGattCharacteristic? = null
             var foundWrite: BluetoothGattCharacteristic? = null
+            val readableChars = mutableListOf<BluetoothGattCharacteristic>()
+            val gattDump = JSONArray()
 
             for (srv in gatt.services) {
+                val srvObj = JSONObject()
+                srvObj.put("uuid", srv.uuid.toString())
+                val chArr = JSONArray()
                 for (ch in srv.characteristics) {
                     val u = ch.uuid.toString().lowercase()
+                    val props = ch.properties
+                    val chObj = JSONObject()
+                    chObj.put("uuid", ch.uuid.toString())
+                    chObj.put("props", props)
+                    chArr.put(chObj)
+
+                    if ((props and BluetoothGattCharacteristic.PROPERTY_READ) != 0) {
+                        readableChars.add(ch)
+                    }
+
                     if (u.startsWith("00002b10") ||
                         u.endsWith("0a0b0c0d2b10") ||
                         u == "00000002-0000-1001-8001-00805f9b07d0"
@@ -310,6 +335,8 @@ class BridgeService : Service() {
                         foundWrite = ch
                     }
                 }
+                srvObj.put("chars", chArr)
+                gattDump.put(srvObj)
             }
 
             if (foundNotify == null || foundWrite == null) {
@@ -337,37 +364,86 @@ class BridgeService : Service() {
             }
 
             if (foundNotify == null || foundWrite == null) {
-                val details = gatt.services.joinToString("; ") { srv ->
-                    val sShort = srv.uuid.toString().substring(4, 8).uppercase()
-                    val chars = srv.characteristics.joinToString(",") {
-                        it.uuid.toString().substring(4, 8).uppercase()
-                    }
-                    "$sShort[$chars]"
-                }
-                stopBridge("Канал не найден ($details)")
+                stopBridge("Канал не найден")
                 return
             }
 
             writeChar = foundWrite
-            gatt.setCharacteristicNotification(foundNotify, true)
-            val descriptor = foundNotify.getDescriptor(CCCD_UUID)
-            if (descriptor != null) {
-                val enableVal = if ((foundNotify.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
-                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                } else {
-                    BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+            val notifyChar = foundNotify
+
+            scope.launch {
+                // Читаем все доступные для чтения характеристики (например 00000003 в FD50)
+                val readResults = JSONObject()
+                for (rch in readableChars) {
+                    if (stopping) break
+                    val deferred = CompletableDeferred<ByteArray?>()
+                    readAck = deferred
+                    val ok = try {
+                        gatt.readCharacteristic(rch)
+                    } catch (_: Exception) {
+                        false
+                    }
+                    if (ok) {
+                        val bytes = withTimeoutOrNull(800) { deferred.await() }
+                        if (bytes != null) {
+                            readResults.put(rch.uuid.toString(), bytes.toHex())
+                        }
+                    }
                 }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    gatt.writeDescriptor(descriptor, enableVal)
-                } else {
-                    @Suppress("DEPRECATION")
-                    descriptor.value = enableVal
-                    @Suppress("DEPRECATION")
-                    gatt.writeDescriptor(descriptor)
+
+                val dumpMsg = JSONObject().apply {
+                    put("type", "ble_gatt_dump")
+                    put("mac", targetMac)
+                    put("adv", lastAdvHex)
+                    put("gatt", gattDump)
+                    put("reads", readResults)
                 }
-            } else {
-                notifyReadyToServer()
+                webSocket?.send(dumpMsg.toString())
+
+                delay(100)
+                if (stopping) return@launch
+
+                gatt.setCharacteristicNotification(notifyChar, true)
+                val descriptor = notifyChar.getDescriptor(CCCD_UUID)
+                if (descriptor != null) {
+                    val enableVal = if ((notifyChar.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
+                        BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    } else {
+                        BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                    }
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        gatt.writeDescriptor(descriptor, enableVal)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        descriptor.value = enableVal
+                        @Suppress("DEPRECATION")
+                        gatt.writeDescriptor(descriptor)
+                    }
+                } else {
+                    notifyReadyToServer()
+                }
             }
+        }
+
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            status: Int
+        ) {
+            @Suppress("DEPRECATION")
+            val data = if (status == BluetoothGatt.GATT_SUCCESS) characteristic.value else null
+            readAck?.complete(data)
+        }
+
+        override fun onCharacteristicRead(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray,
+            status: Int
+        ) {
+            val data = if (status == BluetoothGatt.GATT_SUCCESS) value else null
+            readAck?.complete(data)
         }
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
