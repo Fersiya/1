@@ -1,15 +1,7 @@
-# Tuya BLE Ambilight Bridge
+# LumaLink Android
 
-Мост `ПК (Python) -> Wi-Fi (WebSocket) -> Android (Kotlin) -> BLE -> Лампа Tuya`.
+Мобильное приложение-мост для синхронизации цвета экрана ПК с умной Bluetooth-лампой.
 
-## Сборка APK через GitHub Actions
-1. Загрузите содержимое этой папки в корень репозитория GitHub (убедитесь, что скрытая папка `.github` тоже попала в репозиторий).
-2. Откройте вкладку **Actions** -> **Build Android APK** и скачайте артефакт `tuya-ble-bridge-debug`.
-
-## Запуск сервера на ПК
-1. Впишите свои `DEVICE_ID`, `LOCAL_KEY` и `DEVICE_UUID` в `pc/bridge.py`.
-2. Установите зависимости и запустите скрипт:
-   ```bash
-   pip install aiohttp mss pycryptodome
-   python pc/bridge.py
-   ```
+## Сборка APK на GitHub
+1. Загрузите все файлы из этой папки в корень репозитория GitHub (включая `.github/workflows/build-android.yml`).
+2. Откройте вкладку **Actions** → **Build LumaLink Android APK** и скачайте артефакт **`LumaLink-Android`** (`app-debug.apk`).

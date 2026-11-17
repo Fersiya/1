@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.tuya.blebridge"
+    namespace = "com.lumalink.bridge"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.tuya.blebridge"
+        applicationId = "com.lumalink.bridge"
         minSdk = 26
         targetSdk = 34
         versionCode = 1

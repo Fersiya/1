@@ -1,13 +1,15 @@
-package com.tuya.blebridge
+package com.lumalink.bridge
 
 import android.annotation.SuppressLint
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.*
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Color
 import android.os.Build
 import android.os.IBinder
 import android.os.PowerManager
@@ -31,14 +33,15 @@ class BridgeService : Service() {
         const val EXTRA_IP = "pc_ip"
         const val EXTRA_MAC = "ble_mac"
 
-        val TUYA_SERVICE_PRIMARY: UUID = UUID.fromString("00001910-0000-1000-8000-00805f9b34fb")
-        val TUYA_SERVICE_ALT: UUID = UUID.fromString("0000a201-0000-1000-8000-00805f9b34fb")
-        val TUYA_CHAR_NOTIFY: UUID = UUID.fromString("00002b10-0000-1000-8000-00805f9b34fb")
-        val TUYA_CHAR_WRITE: UUID = UUID.fromString("00002b11-0000-1000-8000-00805f9b34fb")
+        val LIGHT_SERVICE_PRIMARY: UUID = UUID.fromString("00001910-0000-1000-8000-00805f9b34fb")
+        val LIGHT_SERVICE_ALT: UUID = UUID.fromString("0000a201-0000-1000-8000-00805f9b34fb")
+        val LIGHT_CHAR_NOTIFY: UUID = UUID.fromString("00002b10-0000-1000-8000-00805f9b34fb")
+        val LIGHT_CHAR_WRITE: UUID = UUID.fromString("00002b11-0000-1000-8000-00805f9b34fb")
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-        val statusFlow = MutableStateFlow("Мост остановлен")
+        val statusFlow = MutableStateFlow("Готов к подключению")
         val isRunning = MutableStateFlow(false)
+        val liveColorFlow = MutableStateFlow(Color.parseColor("#1E293B"))
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -65,22 +68,34 @@ class BridgeService : Service() {
         startForegroundServiceNotification()
         acquireWakeLock()
         isRunning.value = true
-        updateStatus("Подключение к ws://$pcIp:8000/ws...")
+        updateStatus("Подключение к ПК ($pcIp)...")
 
         connectWebSocket(pcIp, bleMac)
         return START_STICKY
     }
 
     private fun startForegroundServiceNotification() {
-        val channelId = "tuya_bridge_channel"
+        val channelId = "lumalink_bridge_channel"
         val nm = getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
-            NotificationChannel(channelId, "Tuya BLE Bridge", NotificationManager.IMPORTANCE_LOW)
+            NotificationChannel(channelId, "LumaLink Мост", NotificationManager.IMPORTANCE_LOW)
         )
+
+        val openAppIntent = PendingIntent.getActivity(
+            this, 0, Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+        val stopIntent = PendingIntent.getService(
+            this, 1, Intent(this, BridgeService::class.java).apply { action = ACTION_STOP },
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
         val notification = NotificationCompat.Builder(this, channelId)
-            .setContentTitle("Tuya BLE Ambilight Мост")
-            .setContentText("Трансляция Wi-Fi → Bluetooth активна")
+            .setContentTitle("LumaLink активен")
+            .setContentText("Синхронизация света ПК → Bluetooth")
             .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
+            .setContentIntent(openAppIntent)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Остановить", stopIntent)
             .setOngoing(true)
             .build()
 
@@ -93,8 +108,8 @@ class BridgeService : Service() {
 
     private fun acquireWakeLock() {
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
-        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TuyaBridge::WakeLock").apply {
-            acquire(6 * 60 * 60 * 1000L)
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "LumaLink::WakeLock").apply {
+            acquire(8 * 60 * 60 * 1000L)
         }
     }
 
@@ -104,7 +119,7 @@ class BridgeService : Service() {
 
         webSocket = okHttpClient!!.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
-                updateStatus("WebSocket подключён. Поиск GATT лампы...")
+                updateStatus("ПК на связи. Подключаем лампу...")
                 connectBle(bleMac)
                 startWriteLoop()
             }
@@ -116,6 +131,10 @@ class BridgeService : Service() {
             override fun onMessage(ws: WebSocket, text: String) {
                 try {
                     val json = JSONObject(text)
+                    if (json.has("rgb")) {
+                        val arr = json.getJSONArray("rgb")
+                        liveColorFlow.value = Color.rgb(arr.getInt(0), arr.getInt(1), arr.getInt(2))
+                    }
                     if (json.has("status")) updateStatus(json.getString("status"))
                     else if (json.has("log")) updateStatus(json.getString("log"))
                 } catch (_: Exception) {
@@ -123,12 +142,12 @@ class BridgeService : Service() {
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                updateStatus("Ошибка WS: ${t.message}")
+                updateStatus("Нет связи с ПК: ${t.message}")
                 stopBridge()
             }
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-                updateStatus("WS закрыт: $reason")
+                updateStatus("Соединение с ПК закрыто")
                 stopBridge()
             }
         })
@@ -143,10 +162,10 @@ class BridgeService : Service() {
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                updateStatus("BLE подключён, чтение сервисов...")
+                updateStatus("Bluetooth подключён, настройка канала...")
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                updateStatus("Лампа отключилась (status=$status)")
+                updateStatus("Лампа отключилась")
                 webSocket?.send("""{"type":"ble_disconnected"}""")
                 stopBridge()
             }
@@ -154,20 +173,22 @@ class BridgeService : Service() {
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                updateStatus("Ошибка discovery GATT: $status")
+                updateStatus("Ошибка чтения сервисов лампы")
                 return
             }
-            val service = gatt.getService(TUYA_SERVICE_PRIMARY) ?: gatt.getService(TUYA_SERVICE_ALT)
+            val service = gatt.getService(LIGHT_SERVICE_PRIMARY) ?: gatt.getService(LIGHT_SERVICE_ALT)
             if (service == null) {
-                updateStatus("Сервис Tuya (0x1910 / 0xA201) не найден!")
+                updateStatus("Выбрано неверное устройство (это не умная лампа)")
+                stopBridge()
                 return
             }
 
-            val notifyChar = service.getCharacteristic(TUYA_CHAR_NOTIFY)
-            writeChar = service.getCharacteristic(TUYA_CHAR_WRITE)
+            val notifyChar = service.getCharacteristic(LIGHT_CHAR_NOTIFY)
+            writeChar = service.getCharacteristic(LIGHT_CHAR_WRITE)
 
             if (notifyChar == null || writeChar == null) {
-                updateStatus("Характеристики 0x2B10 / 0x2B11 не найдены!")
+                updateStatus("Канал управления лампой не найден")
+                stopBridge()
                 return
             }
 
@@ -212,7 +233,7 @@ class BridgeService : Service() {
     }
 
     private fun notifyReadyToServer() {
-        updateStatus("GATT готов! Запуск рукопожатия Tuya...")
+        updateStatus("Авторизация лампы...")
         webSocket?.send("""{"type":"ble_connected"}""")
     }
 
@@ -254,6 +275,7 @@ class BridgeService : Service() {
 
     private fun stopBridge() {
         isRunning.value = false
+        liveColorFlow.value = Color.parseColor("#1E293B")
         scope.cancel()
         try { webSocket?.close(1000, "Stopped") } catch (_: Exception) {}
         try { bluetoothGatt?.disconnect(); bluetoothGatt?.close() } catch (_: Exception) {}
