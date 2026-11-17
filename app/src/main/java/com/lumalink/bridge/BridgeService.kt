@@ -54,14 +54,17 @@ class BridgeService : Service() {
     private var bluetoothGatt: BluetoothGatt? = null
     private var writeChar: BluetoothGattCharacteristic? = null
 
-    private val writeQueue = Channel<ByteArray>(capacity = 8, onBufferOverflow = BufferOverflow.DROP_OLDEST)
-    private var writeAck: CompletableDeferred<Unit>? = null
+    private val writeQueue = Channel<ByteArray>(capacity = 16, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    private var writeAck: CompletableDeferred<Int>? = null
 
     @Volatile
     private var stopping = false
 
     @Volatile
     private var bleConnectedOnce = false
+
+    @Volatile
+    private var negotiatedMtu = 23
 
     private var targetMac: String = ""
     private var connectAttempt = 0
@@ -80,6 +83,7 @@ class BridgeService : Service() {
 
         stopping = false
         bleConnectedOnce = false
+        negotiatedMtu = 23
         targetMac = bleMac
         connectAttempt = 0
 
@@ -234,11 +238,20 @@ class BridgeService : Service() {
 
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 bleConnectedOnce = true
-                updateStatus("Bluetooth подключён, чтение каналов...")
+                updateStatus("Bluetooth подключён, согласование MTU...")
                 refreshGattCache(gatt)
                 scope.launch {
-                    delay(250)
-                    if (!stopping) gatt.discoverServices()
+                    delay(200)
+                    if (!stopping) {
+                        val mtuRequested = try {
+                            gatt.requestMtu(247)
+                        } catch (_: Exception) {
+                            false
+                        }
+                        if (!mtuRequested) {
+                            gatt.discoverServices()
+                        }
+                    }
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 try { gatt.close() } catch (_: Exception) {}
@@ -252,12 +265,23 @@ class BridgeService : Service() {
                 } else {
                     webSocket?.send("""{"type":"ble_disconnected"}""")
                     val reason = if (status == 133 || status == 8 || status == 22) {
-                        "Лампа занята или недоступна (BLE код $status). Закройте Smart Life в настройках!"
+                        "Лампа занята или недоступна (BLE код $status). Перезапустите Bluetooth!"
                     } else {
                         "Лампа отключилась (BLE код $status)"
                     }
                     stopBridge(reason)
                 }
+            }
+        }
+
+        override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+            if (stopping) return
+            if (status == BluetoothGatt.GATT_SUCCESS && mtu >= 23) {
+                negotiatedMtu = mtu
+            }
+            scope.launch {
+                delay(150)
+                if (!stopping) gatt.discoverServices()
             }
         }
 
@@ -271,7 +295,6 @@ class BridgeService : Service() {
             var foundNotify: BluetoothGattCharacteristic? = null
             var foundWrite: BluetoothGattCharacteristic? = null
 
-            // 1. Поиск по известным UUID Tuya BLE (legacy 2b10/2b11 и новый стек FD50 0001/0002)
             for (srv in gatt.services) {
                 for (ch in srv.characteristics) {
                     val u = ch.uuid.toString().lowercase()
@@ -289,7 +312,6 @@ class BridgeService : Service() {
                 }
             }
 
-            // 2. Резервный поиск внутри сервисов Tuya (FD50 / 1910 / A201) по свойствам характеристик
             if (foundNotify == null || foundWrite == null) {
                 val tuyaService = gatt.getService(LIGHT_SERVICE_TUYA_FD50)
                     ?: gatt.getService(LIGHT_SERVICE_PRIMARY)
@@ -349,11 +371,14 @@ class BridgeService : Service() {
         }
 
         override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-            notifyReadyToServer()
+            scope.launch {
+                delay(150)
+                if (!stopping) notifyReadyToServer()
+            }
         }
 
         override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-            writeAck?.complete(Unit)
+            writeAck?.complete(status)
         }
 
         @Deprecated("Deprecated in Java")
@@ -373,8 +398,9 @@ class BridgeService : Service() {
     }
 
     private fun notifyReadyToServer() {
-        updateStatus("Канал готов! Авторизация лампы...")
-        webSocket?.send("""{"type":"ble_connected"}""")
+        val props = writeChar?.properties ?: 0
+        updateStatus("Канал готов (MTU=$negotiatedMtu)! Авторизация...")
+        webSocket?.send("""{"type":"ble_connected","mtu":$negotiatedMtu,"write_props":$props}""")
     }
 
     private fun startWriteLoop() {
@@ -384,13 +410,15 @@ class BridgeService : Service() {
                 val gatt = bluetoothGatt ?: break
                 val char = writeChar ?: break
 
-                val deferred = CompletableDeferred<Unit>()
+                val deferred = CompletableDeferred<Int>()
                 writeAck = deferred
 
-                val writeType = if ((char.properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0) {
-                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
-                } else {
+                // Используем Write With Response если поддерживается, иначе No Response с паузой
+                val hasWriteResp = (char.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0
+                val writeType = if (hasWriteResp) {
                     BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                } else {
+                    BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
                 }
 
                 val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -404,7 +432,14 @@ class BridgeService : Service() {
                 }
 
                 if (started) {
-                    withTimeoutOrNull(400) { deferred.await() }
+                    val ackStatus = withTimeoutOrNull(500) { deferred.await() }
+                    if (ackStatus != null && ackStatus != BluetoothGatt.GATT_SUCCESS) {
+                        webSocket?.send("""{"type":"ble_tx_err","status":$ackStatus,"len":${chunk.size}}""")
+                    }
+                    // Небольшая пауза между фрагментами для защиты RX-буфера BLE-чипа
+                    delay(if (hasWriteResp) 15L else 35L)
+                } else {
+                    webSocket?.send("""{"type":"ble_tx_err","status":-1,"len":${chunk.size}}""")
                 }
             }
         }
