@@ -502,14 +502,19 @@ class BridgeService : Service() {
                     BluetoothGattCharacteristic.WRITE_TYPE_NO_RESPONSE
                 }
 
-                val started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    gatt.writeCharacteristic(char, chunk, writeType) == BluetoothStatusCodes.SUCCESS
-                } else {
-                    @Suppress("DEPRECATION")
-                    char.value = chunk
-                    char.writeType = writeType
-                    @Suppress("DEPRECATION")
-                    gatt.writeCharacteristic(char)
+                var started = false
+                for (retry in 0..3) {
+                    started = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        gatt.writeCharacteristic(char, chunk, writeType) == BluetoothStatusCodes.SUCCESS
+                    } else {
+                        @Suppress("DEPRECATION")
+                        char.value = chunk
+                        char.writeType = writeType
+                        @Suppress("DEPRECATION")
+                        gatt.writeCharacteristic(char)
+                    }
+                    if (started) break
+                    delay(15L)
                 }
 
                 if (started) {
