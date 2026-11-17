@@ -6,6 +6,10 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.*
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -35,8 +39,6 @@ class BridgeService : Service() {
 
         val LIGHT_SERVICE_PRIMARY: UUID = UUID.fromString("00001910-0000-1000-8000-00805f9b34fb")
         val LIGHT_SERVICE_ALT: UUID = UUID.fromString("0000a201-0000-1000-8000-00805f9b34fb")
-        val LIGHT_CHAR_NOTIFY: UUID = UUID.fromString("00002b10-0000-1000-8000-00805f9b34fb")
-        val LIGHT_CHAR_WRITE: UUID = UUID.fromString("00002b11-0000-1000-8000-00805f9b34fb")
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
         val statusFlow = MutableStateFlow("Готов к подключению")
@@ -54,16 +56,31 @@ class BridgeService : Service() {
     private val writeQueue = Channel<ByteArray>(capacity = 8, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     private var writeAck: CompletableDeferred<Unit>? = null
 
+    @Volatile
+    private var stopping = false
+
+    @Volatile
+    private var bleConnectedOnce = false
+
+    private var targetMac: String = ""
+    private var connectAttempt = 0
+    private val maxConnectAttempts = 3
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_STOP) {
-            stopBridge()
+            stopBridge("Мост остановлен")
             return START_NOT_STICKY
         }
 
         val pcIp = intent?.getStringExtra(EXTRA_IP) ?: return START_NOT_STICKY
-        val bleMac = intent.getStringExtra(EXTRA_MAC) ?: return START_NOT_STICKY
+        val bleMac = intent?.getStringExtra(EXTRA_MAC) ?: return START_NOT_STICKY
+
+        stopping = false
+        bleConnectedOnce = false
+        targetMac = bleMac
+        connectAttempt = 0
 
         startForegroundServiceNotification()
         acquireWakeLock()
@@ -119,9 +136,11 @@ class BridgeService : Service() {
 
         webSocket = okHttpClient!!.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
-                updateStatus("ПК на связи. Подключаем лампу...")
-                connectBle(bleMac)
+                updateStatus("ПК на связи. Поиск лампы по Bluetooth...")
                 startWriteLoop()
+                scope.launch {
+                    connectBleWithRetry(bleMac)
+                }
             }
 
             override fun onMessage(ws: WebSocket, bytes: ByteString) {
@@ -142,58 +161,139 @@ class BridgeService : Service() {
             }
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
-                updateStatus("Нет связи с ПК: ${t.message}")
-                stopBridge()
+                if (!stopping) {
+                    stopBridge("Нет связи с ПК: ${t.message}")
+                }
             }
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
-                updateStatus("Соединение с ПК закрыто")
-                stopBridge()
+                if (!stopping) {
+                    stopBridge("Соединение с ПК закрыто")
+                }
             }
         })
     }
 
-    private fun connectBle(mac: String) {
+    private suspend fun connectBleWithRetry(mac: String) {
+        if (stopping) return
+        connectAttempt++
+
         val manager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-        val device = manager.adapter.getRemoteDevice(mac)
+        val adapter = manager.adapter
+        if (adapter == null || !adapter.isEnabled) {
+            stopBridge("Включите Bluetooth на телефоне!")
+            return
+        }
+
+        // Короткое точечное сканирование перед подключением обновляет BLE-кэш Android
+        val scanner = adapter.bluetoothLeScanner
+        if (scanner != null) {
+            val foundSignal = CompletableDeferred<Boolean>()
+            val cb = object : ScanCallback() {
+                override fun onScanResult(callbackType: Int, result: ScanResult) {
+                    if (result.device.address.equals(mac, ignoreCase = true)) {
+                        foundSignal.complete(true)
+                    }
+                }
+            }
+            try {
+                val filter = ScanFilter.Builder().setDeviceAddress(mac).build()
+                val settings = ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                    .build()
+                scanner.startScan(listOf(filter), settings, cb)
+                withTimeoutOrNull(2500) { foundSignal.await() }
+                scanner.stopScan(cb)
+            } catch (_: Exception) {
+            }
+        }
+
+        if (stopping) return
+        updateStatus("Подключаем лампу (попытка $connectAttempt/$maxConnectAttempts)...")
+
+        try {
+            bluetoothGatt?.close()
+        } catch (_: Exception) {
+        }
+
+        val device = adapter.getRemoteDevice(mac)
         bluetoothGatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+    }
+
+    private fun refreshGattCache(gatt: BluetoothGatt) {
+        try {
+            val refreshMethod = gatt.javaClass.getMethod("refresh")
+            refreshMethod.invoke(gatt)
+        } catch (_: Exception) {
+        }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            if (stopping) return
+
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                updateStatus("Bluetooth подключён, настройка канала...")
-                gatt.discoverServices()
+                bleConnectedOnce = true
+                updateStatus("Bluetooth подключён, чтение каналов...")
+                refreshGattCache(gatt)
+                scope.launch {
+                    delay(250)
+                    if (!stopping) gatt.discoverServices()
+                }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                updateStatus("Лампа отключилась")
-                webSocket?.send("""{"type":"ble_disconnected"}""")
-                stopBridge()
+                try { gatt.close() } catch (_: Exception) {}
+
+                if (!bleConnectedOnce && connectAttempt < maxConnectAttempts && !stopping) {
+                    updateStatus("Повтор подключения BLE (код $status)...")
+                    scope.launch {
+                        delay(700)
+                        connectBleWithRetry(targetMac)
+                    }
+                } else {
+                    webSocket?.send("""{"type":"ble_disconnected"}""")
+                    val reason = if (status == 133 || status == 8 || status == 22) {
+                        "Лампа занята или недоступна (BLE код $status). Закройте Smart Life в настройках!"
+                    } else {
+                        "Лампа отключилась (BLE код $status)"
+                    }
+                    stopBridge(reason)
+                }
             }
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            if (stopping) return
             if (status != BluetoothGatt.GATT_SUCCESS) {
-                updateStatus("Ошибка чтения сервисов лампы")
-                return
-            }
-            val service = gatt.getService(LIGHT_SERVICE_PRIMARY) ?: gatt.getService(LIGHT_SERVICE_ALT)
-            if (service == null) {
-                updateStatus("Выбрано неверное устройство (это не умная лампа)")
-                stopBridge()
+                stopBridge("Ошибка чтения сервисов лампы (код $status)")
                 return
             }
 
-            val notifyChar = service.getCharacteristic(LIGHT_CHAR_NOTIFY)
-            writeChar = service.getCharacteristic(LIGHT_CHAR_WRITE)
+            // Ищем характеристики 2b10 (Notify) и 2b11 (Write) среди всех сервисов (16-бит и 128-бит Tuya/Telink)
+            var foundNotify: BluetoothGattCharacteristic? = null
+            var foundWrite: BluetoothGattCharacteristic? = null
 
-            if (notifyChar == null || writeChar == null) {
-                updateStatus("Канал управления лампой не найден")
-                stopBridge()
+            for (srv in gatt.services) {
+                for (ch in srv.characteristics) {
+                    val u = ch.uuid.toString().lowercase()
+                    if (u.startsWith("00002b10") || u.endsWith("0a0b0c0d2b10")) {
+                        foundNotify = ch
+                    } else if (u.startsWith("00002b11") || u.endsWith("0a0b0c0d2b11")) {
+                        foundWrite = ch
+                    }
+                }
+            }
+
+            if (foundNotify == null || foundWrite == null) {
+                val foundList = gatt.services.joinToString(", ") {
+                    it.uuid.toString().substring(4, 8).uppercase()
+                }
+                stopBridge("Канал управления не найден (сервисы: $foundList)")
                 return
             }
 
-            gatt.setCharacteristicNotification(notifyChar, true)
-            val descriptor = notifyChar.getDescriptor(CCCD_UUID)
+            writeChar = foundWrite
+            gatt.setCharacteristicNotification(foundNotify, true)
+            val descriptor = foundNotify.getDescriptor(CCCD_UUID)
             if (descriptor != null) {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                     gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
@@ -233,13 +333,14 @@ class BridgeService : Service() {
     }
 
     private fun notifyReadyToServer() {
-        updateStatus("Авторизация лампы...")
+        updateStatus("Канал готов! Авторизация лампы...")
         webSocket?.send("""{"type":"ble_connected"}""")
     }
 
     private fun startWriteLoop() {
         scope.launch {
             for (chunk in writeQueue) {
+                if (stopping) break
                 val gatt = bluetoothGatt ?: break
                 val char = writeChar ?: break
 
@@ -273,7 +374,12 @@ class BridgeService : Service() {
         statusFlow.value = msg
     }
 
-    private fun stopBridge() {
+    private fun stopBridge(finalMessage: String? = null) {
+        if (stopping) return
+        stopping = true
+        if (finalMessage != null) {
+            updateStatus(finalMessage)
+        }
         isRunning.value = false
         liveColorFlow.value = Color.parseColor("#1E293B")
         scope.cancel()
