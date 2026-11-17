@@ -32,6 +32,11 @@ jobs:
       - name: Rename APK
         run: cp app/build/outputs/apk/debug/app-debug.apk LumaLink.apk
 
+      - name: Remove previous latest release (so its date updates)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release delete latest --cleanup-tag --yes || true
+
       - name: Publish to GitHub Release
         uses: softprops/action-gh-release@v2
         with:
