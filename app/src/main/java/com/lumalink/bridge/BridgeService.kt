@@ -55,7 +55,7 @@ class BridgeService : Service() {
     private var bluetoothGatt: BluetoothGatt? = null
     private var writeChar: BluetoothGattCharacteristic? = null
 
-    private val writeQueue = Channel<ByteArray>(capacity = 16, onBufferOverflow = BufferOverflow.DROP_OLDEST)
+    private val writeQueue = Channel<ByteArray>(capacity = 128, onBufferOverflow = BufferOverflow.DROP_OLDEST)
     private var writeAck: CompletableDeferred<Int>? = null
     private var readAck: CompletableDeferred<ByteArray?>? = null
 
@@ -513,11 +513,17 @@ class BridgeService : Service() {
                 }
 
                 if (started) {
-                    val ackStatus = withTimeoutOrNull(500) { deferred.await() }
-                    if (ackStatus != null && ackStatus != BluetoothGatt.GATT_SUCCESS) {
-                        webSocket?.send("""{"type":"ble_tx_err","status":$ackStatus,"len":${chunk.size}}""")
+                    if (hasWriteResp) {
+                        val ackStatus = withTimeoutOrNull(500) { deferred.await() }
+                        if (ackStatus != null && ackStatus != BluetoothGatt.GATT_SUCCESS) {
+                            webSocket?.send("""{"type":"ble_tx_err","status":$ackStatus,"len":${chunk.size}}""")
+                        }
+                        delay(15L)
+                    } else {
+                        // Для WRITE_TYPE_NO_RESPONSE onCharacteristicWrite не вызывается на большинстве версий Android.
+                        // Не ждем таймаут 500мс, а даем паузу для стабильной передачи по BLE радиоканалу.
+                        delay(12L)
                     }
-                    delay(if (hasWriteResp) 15L else 35L)
                 } else {
                     webSocket?.send("""{"type":"ble_tx_err","status":-1,"len":${chunk.size}}""")
                 }
