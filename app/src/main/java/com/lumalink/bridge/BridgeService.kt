@@ -413,7 +413,6 @@ class BridgeService : Service() {
                 val deferred = CompletableDeferred<Int>()
                 writeAck = deferred
 
-                // Используем Write With Response если поддерживается, иначе No Response с паузой
                 val hasWriteResp = (char.properties and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0
                 val writeType = if (hasWriteResp) {
                     BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
@@ -436,7 +435,6 @@ class BridgeService : Service() {
                     if (ackStatus != null && ackStatus != BluetoothGatt.GATT_SUCCESS) {
                         webSocket?.send("""{"type":"ble_tx_err","status":$ackStatus,"len":${chunk.size}}""")
                     }
-                    // Небольшая пауза между фрагментами для защиты RX-буфера BLE-чипа
                     delay(if (hasWriteResp) 15L else 35L)
                 } else {
                     webSocket?.send("""{"type":"ble_tx_err","status":-1,"len":${chunk.size}}""")
