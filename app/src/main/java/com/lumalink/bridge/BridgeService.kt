@@ -39,6 +39,7 @@ class BridgeService : Service() {
 
         val LIGHT_SERVICE_PRIMARY: UUID = UUID.fromString("00001910-0000-1000-8000-00805f9b34fb")
         val LIGHT_SERVICE_ALT: UUID = UUID.fromString("0000a201-0000-1000-8000-00805f9b34fb")
+        val LIGHT_SERVICE_TUYA_FD50: UUID = UUID.fromString("0000fd50-0000-1000-8000-00805f9b34fb")
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
         val statusFlow = MutableStateFlow("Готов к подключению")
@@ -185,7 +186,6 @@ class BridgeService : Service() {
             return
         }
 
-        // Короткое точечное сканирование перед подключением обновляет BLE-кэш Android
         val scanner = adapter.bluetoothLeScanner
         if (scanner != null) {
             val foundSignal = CompletableDeferred<Boolean>()
@@ -268,26 +268,61 @@ class BridgeService : Service() {
                 return
             }
 
-            // Ищем характеристики 2b10 (Notify) и 2b11 (Write) среди всех сервисов (16-бит и 128-бит Tuya/Telink)
             var foundNotify: BluetoothGattCharacteristic? = null
             var foundWrite: BluetoothGattCharacteristic? = null
 
+            // 1. Поиск по известным UUID Tuya BLE (legacy 2b10/2b11 и новый стек FD50 0001/0002)
             for (srv in gatt.services) {
                 for (ch in srv.characteristics) {
                     val u = ch.uuid.toString().lowercase()
-                    if (u.startsWith("00002b10") || u.endsWith("0a0b0c0d2b10")) {
+                    if (u.startsWith("00002b10") ||
+                        u.endsWith("0a0b0c0d2b10") ||
+                        u == "00000002-0000-1001-8001-00805f9b07d0"
+                    ) {
                         foundNotify = ch
-                    } else if (u.startsWith("00002b11") || u.endsWith("0a0b0c0d2b11")) {
+                    } else if (u.startsWith("00002b11") ||
+                        u.endsWith("0a0b0c0d2b11") ||
+                        u == "00000001-0000-1001-8001-00805f9b07d0"
+                    ) {
                         foundWrite = ch
                     }
                 }
             }
 
+            // 2. Резервный поиск внутри сервисов Tuya (FD50 / 1910 / A201) по свойствам характеристик
             if (foundNotify == null || foundWrite == null) {
-                val foundList = gatt.services.joinToString(", ") {
-                    it.uuid.toString().substring(4, 8).uppercase()
+                val tuyaService = gatt.getService(LIGHT_SERVICE_TUYA_FD50)
+                    ?: gatt.getService(LIGHT_SERVICE_PRIMARY)
+                    ?: gatt.getService(LIGHT_SERVICE_ALT)
+
+                if (tuyaService != null) {
+                    for (ch in tuyaService.characteristics) {
+                        val props = ch.properties
+                        if (foundNotify == null &&
+                            ((props and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0 ||
+                             (props and BluetoothGattCharacteristic.PROPERTY_INDICATE) != 0)
+                        ) {
+                            foundNotify = ch
+                        }
+                        if (foundWrite == null &&
+                            ((props and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE) != 0 ||
+                             (props and BluetoothGattCharacteristic.PROPERTY_WRITE) != 0)
+                        ) {
+                            foundWrite = ch
+                        }
+                    }
                 }
-                stopBridge("Канал управления не найден (сервисы: $foundList)")
+            }
+
+            if (foundNotify == null || foundWrite == null) {
+                val details = gatt.services.joinToString("; ") { srv ->
+                    val sShort = srv.uuid.toString().substring(4, 8).uppercase()
+                    val chars = srv.characteristics.joinToString(",") {
+                        it.uuid.toString().substring(4, 8).uppercase()
+                    }
+                    "$sShort[$chars]"
+                }
+                stopBridge("Канал не найден ($details)")
                 return
             }
 
@@ -295,11 +330,16 @@ class BridgeService : Service() {
             gatt.setCharacteristicNotification(foundNotify, true)
             val descriptor = foundNotify.getDescriptor(CCCD_UUID)
             if (descriptor != null) {
+                val enableVal = if ((foundNotify.properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY) != 0) {
+                    BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                } else {
+                    BluetoothGattDescriptor.ENABLE_INDICATION_VALUE
+                }
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                    gatt.writeDescriptor(descriptor, enableVal)
                 } else {
                     @Suppress("DEPRECATION")
-                    descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    descriptor.value = enableVal
                     @Suppress("DEPRECATION")
                     gatt.writeDescriptor(descriptor)
                 }
