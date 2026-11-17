@@ -104,7 +104,6 @@ class MainActivity : AppCompatActivity() {
         }
         scroll.addView(root)
 
-        // --- ШАПКА С ЖИВЫМ ИНДИКАТОРОМ ЦВЕТА ---
         val headerRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -135,7 +134,6 @@ class MainActivity : AppCompatActivity() {
         headerRow.addView(titleCol, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         root.addView(headerRow)
 
-        // --- КАРТОЧКА СТАТУСА ---
         val statusCard = createCard().apply {
             setPadding(dp(16), dp(14), dp(16), dp(14))
         }
@@ -148,7 +146,6 @@ class MainActivity : AppCompatActivity() {
         statusCard.addView(statusText)
         root.addView(statusCard, cardParams())
 
-        // --- КАРТОЧКА ПОДКЛЮЧЕНИЯ К ПК ---
         val pcCard = createCard().apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(14), dp(16), dp(16))
@@ -187,7 +184,6 @@ class MainActivity : AppCompatActivity() {
 
         root.addView(pcCard, cardParams())
 
-        // --- БЫСТРОЕ ПОДКЛЮЧЕНИЕ К СОХРАНЕННОЙ ЛАМПЕ ---
         if (!savedMac.isNullOrEmpty()) {
             val quickCard = createCard().apply {
                 orientation = LinearLayout.VERTICAL
@@ -209,7 +205,6 @@ class MainActivity : AppCompatActivity() {
             root.addView(quickCard, cardParams())
         }
 
-        // --- КАРТОЧКА ПОИСКА И УПРАВЛЕНИЯ ---
         val scanCard = createCard().apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(14), dp(16), dp(16))
@@ -262,7 +257,6 @@ class MainActivity : AppCompatActivity() {
         root.addView(scanCard, cardParams())
         setContentView(scroll)
 
-        // Подписка на статус сервиса и живой цвет
         lifecycleScope.launch {
             BridgeService.statusFlow.collect { msg ->
                 statusText.text = msg
@@ -274,7 +268,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Автопоиск ПК в домашней Wi-Fi сети
         startPcDiscovery()
     }
 
@@ -394,7 +387,8 @@ class MainActivity : AppCompatActivity() {
         val record = result.scanRecord ?: return false
         val uuids = record.serviceUuids ?: emptyList()
         if (uuids.contains(ParcelUuid(BridgeService.LIGHT_SERVICE_PRIMARY)) ||
-            uuids.contains(ParcelUuid(BridgeService.LIGHT_SERVICE_ALT))
+            uuids.contains(ParcelUuid(BridgeService.LIGHT_SERVICE_ALT)) ||
+            uuids.contains(ParcelUuid(BridgeService.LIGHT_SERVICE_TUYA_FD50))
         ) {
             return true
         }
@@ -402,7 +396,7 @@ class MainActivity : AppCompatActivity() {
         if (sData != null) {
             for (key in sData.keys) {
                 val u = key.uuid.toString().lowercase()
-                if (u.startsWith("00001910") || u.startsWith("0000a201")) return true
+                if (u.startsWith("00001910") || u.startsWith("0000a201") || u.startsWith("0000fd50")) return true
             }
         }
         if (record.getManufacturerSpecificData(0x07D0) != null) {
