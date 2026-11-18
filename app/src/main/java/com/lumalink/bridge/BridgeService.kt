@@ -68,10 +68,12 @@ class BridgeService : Service() {
     @Volatile
     private var negotiatedMtu = 23
 
+    private var targetIp: String = ""
     private var targetMac: String = ""
     private var lastAdvHex: String = ""
     private var connectAttempt = 0
-    private val maxConnectAttempts = 3
+    private var wsReconnectJob: Job? = null
+    private var bleReconnectJob: Job? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -93,9 +95,12 @@ class BridgeService : Service() {
         stopping = false
         bleConnectedOnce = false
         negotiatedMtu = 23
+        targetIp = pcIp
         targetMac = bleMac
         lastAdvHex = ""
         connectAttempt = 0
+        wsReconnectJob?.cancel()
+        bleReconnectJob?.cancel()
 
         startBridgeForeground()
         wakeLock = acquireBridgeWakeLock()
@@ -112,10 +117,14 @@ class BridgeService : Service() {
 
         webSocket = okHttpClient!!.newWebSocket(request, object : WebSocketListener() {
             override fun onOpen(ws: WebSocket, response: Response) {
-                updateStatus("ПК на связи. Поиск лампы по Bluetooth...")
+                updateStatus("ПК на связи. Проверка лампы...")
                 startWriteLoop()
-                scope.launch {
-                    connectBleWithRetry(bleMac)
+                if (writeChar != null && negotiatedMtu >= 23) {
+                    notifyReadyToServer()
+                } else if (bluetoothGatt == null) {
+                    scope.launch {
+                        connectBleWithRetry(targetMac)
+                    }
                 }
             }
 
@@ -138,16 +147,44 @@ class BridgeService : Service() {
 
             override fun onFailure(ws: WebSocket, t: Throwable, response: Response?) {
                 if (!stopping) {
-                    stopBridge("Нет связи с ПК: ${t.message}")
+                    scheduleWsReconnect("Нет связи с ПК: ${t.message ?: "ошибка сети"}")
                 }
             }
 
             override fun onClosed(ws: WebSocket, code: Int, reason: String) {
                 if (!stopping) {
-                    stopBridge("Соединение с ПК закрыто")
+                    scheduleWsReconnect("Связь с ПК закрыта")
                 }
             }
         })
+    }
+
+    private fun scheduleWsReconnect(reason: String) {
+        if (stopping) return
+        updateStatus("$reason. Повтор подключения к ПК через 3 с...")
+        liveColorFlow.value = Color.parseColor("#1E293B")
+        try { webSocket?.close(1000, "Reconnect") } catch (_: Exception) {}
+        webSocket = null
+        wsReconnectJob?.cancel()
+        wsReconnectJob = scope.launch {
+            delay(3000)
+            if (!stopping && webSocket == null) {
+                connectWebSocket(targetIp, targetMac)
+            }
+        }
+    }
+
+    private fun scheduleBleReconnect(reason: String) {
+        if (stopping) return
+        val delayMs = if (connectAttempt <= 3) 2000L else 4000L
+        updateStatus("$reason. Повтор через ${delayMs / 1000} с...")
+        bleReconnectJob?.cancel()
+        bleReconnectJob = scope.launch {
+            delay(delayMs)
+            if (!stopping && bluetoothGatt == null) {
+                connectBleWithRetry(targetMac)
+            }
+        }
     }
 
     private suspend fun connectBleWithRetry(mac: String) {
@@ -157,7 +194,7 @@ class BridgeService : Service() {
         val manager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         val adapter = manager.adapter
         if (adapter == null || !adapter.isEnabled) {
-            stopBridge("Включите Bluetooth на телефоне!")
+            scheduleBleReconnect("Bluetooth выключен")
             return
         }
 
@@ -205,6 +242,7 @@ class BridgeService : Service() {
 
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 bleConnectedOnce = true
+                connectAttempt = 0
                 updateStatus("Bluetooth подключён, согласование MTU...")
                 refreshGattCache(gatt)
                 // Короткий интервал соединения (~7–15 мс вместо 30–50 мс): быстрее запись и отклик лампы.
@@ -234,21 +272,18 @@ class BridgeService : Service() {
                 }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 try { gatt.close() } catch (_: Exception) {}
+                bluetoothGatt = null
+                writeChar = null
+                liveColorFlow.value = Color.parseColor("#1E293B")
+                webSocket?.send("""{"type":"ble_disconnected"}""")
 
-                if (!bleConnectedOnce && connectAttempt < maxConnectAttempts && !stopping) {
-                    updateStatus("Повтор подключения BLE (код $status)...")
-                    scope.launch {
-                        delay(700)
-                        connectBleWithRetry(targetMac)
-                    }
-                } else {
-                    webSocket?.send("""{"type":"ble_disconnected"}""")
+                if (!stopping) {
                     val reason = if (status == 133 || status == 8 || status == 22) {
-                        "Лампа занята или недоступна (BLE код $status). Перезапустите Bluetooth!"
+                        "Лампа недоступна (BLE код $status)"
                     } else {
                         "Лампа отключилась (BLE код $status)"
                     }
-                    stopBridge(reason)
+                    scheduleBleReconnect(reason)
                 }
             }
         }
@@ -505,6 +540,8 @@ class BridgeService : Service() {
     private fun stopBridge(finalMessage: String? = null) {
         if (stopping) return
         stopping = true
+        wsReconnectJob?.cancel()
+        bleReconnectJob?.cancel()
         if (finalMessage != null) {
             updateStatus(finalMessage)
         }
