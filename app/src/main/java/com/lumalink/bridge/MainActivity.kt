@@ -41,17 +41,6 @@ class MainActivity : AppCompatActivity() {
         val isSmartLamp: Boolean
     )
 
-    private val bgMain = Color.parseColor("#0B0E14")
-    private val bgCard = Color.parseColor("#141923")
-    private val bgInput = Color.parseColor("#1C2331")
-    private val borderCol = Color.parseColor("#263042")
-    private val accentCol = Color.parseColor("#7C5CFF")
-    private val cyanCol = Color.parseColor("#00E5FF")
-    private val greenCol = Color.parseColor("#10B981")
-    private val redCol = Color.parseColor("#EF4444")
-    private val textPrimary = Color.parseColor("#F8FAFC")
-    private val textMuted = Color.parseColor("#94A3B8")
-
     private lateinit var ipInput: EditText
     private lateinit var discoveredPcBtn: TextView
     private lateinit var statusText: TextView
@@ -277,46 +266,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startPcDiscovery() {
-        lifecycleScope.launch(Dispatchers.IO) {
-            var socket: DatagramSocket? = null
-            try {
-                socket = DatagramSocket().apply {
-                    broadcast = true
-                    soTimeout = 1500
-                }
-                val payload = "LUMALINK_DISCOVER".toByteArray(Charsets.UTF_8)
-                val broadcastAddr = InetAddress.getByName("255.255.255.255")
-
-                repeat(6) {
-                    if (BridgeService.isRunning.value) return@launch
-                    try {
-                        socket.send(DatagramPacket(payload, payload.size, broadcastAddr, 8001))
-                        val buf = ByteArray(512)
-                        val resp = DatagramPacket(buf, buf.size)
-                        socket.receive(resp)
-                        val senderIp = resp.address?.hostAddress ?: return@repeat
-                        val json = JSONObject(String(resp.data, 0, resp.length, Charsets.UTF_8))
-                        if (json.optString("service") == "lumalink") {
-                            val pcName = json.optString("name", "ПК")
-                            withContext(Dispatchers.Main) {
-                                discoveredPcBtn.visibility = View.VISIBLE
-                                discoveredPcBtn.text = "Найден сервер: $pcName ($senderIp) — нажми, чтобы подставить"
-                                discoveredPcBtn.setOnClickListener {
-                                    ipInput.setText(senderIp)
-                                }
-                                if (ipInput.text.toString().endsWith(".")) {
-                                    ipInput.setText(senderIp)
-                                }
-                            }
-                            return@launch
-                        }
-                    } catch (_: Exception) {
-                    }
-                    delay(2000)
-                }
-            } catch (_: Exception) {
-            } finally {
-                try { socket?.close() } catch (_: Exception) {}
+        lifecycleScope.launch {
+            val pc = PcDiscovery.find() ?: return@launch
+            discoveredPcBtn.visibility = View.VISIBLE
+            discoveredPcBtn.text = "Найден сервер: ${pc.name} (${pc.ip}) — нажми, чтобы подставить"
+            discoveredPcBtn.setOnClickListener { ipInput.setText(pc.ip) }
+            if (ipInput.text.toString().endsWith(".")) {
+                ipInput.setText(pc.ip)
             }
         }
     }
@@ -386,28 +342,6 @@ class MainActivity : AppCompatActivity() {
                 renderDeviceList()
             }
         }
-    }
-
-    private fun detectSmartLamp(result: ScanResult): Boolean {
-        val record = result.scanRecord ?: return false
-        val uuids = record.serviceUuids ?: emptyList()
-        if (uuids.contains(ParcelUuid(BridgeService.LIGHT_SERVICE_PRIMARY)) ||
-            uuids.contains(ParcelUuid(BridgeService.LIGHT_SERVICE_ALT)) ||
-            uuids.contains(ParcelUuid(BridgeService.LIGHT_SERVICE_TUYA_FD50))
-        ) {
-            return true
-        }
-        val sData = record.serviceData
-        if (sData != null) {
-            for (key in sData.keys) {
-                val u = key.uuid.toString().lowercase()
-                if (u.startsWith("00001910") || u.startsWith("0000a201") || u.startsWith("0000fd50")) return true
-            }
-        }
-        if (record.getManufacturerSpecificData(0x07D0) != null) {
-            return true
-        }
-        return false
     }
 
     private fun renderDeviceList() {
@@ -523,45 +457,4 @@ class MainActivity : AppCompatActivity() {
             statusText.text = if (foundMap.isEmpty()) "Устройства не найдены" else "Выберите лампу из списка"
         }
     }
-
-    private fun createCard(): LinearLayout = LinearLayout(this).apply {
-        orientation = LinearLayout.VERTICAL
-        background = createRoundedDrawable(bgCard, borderCol, dp(16))
-    }
-
-    private fun cardParams(): LinearLayout.LayoutParams = LinearLayout.LayoutParams(
-        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
-    ).apply { bottomMargin = dp(12) }
-
-    private fun createButton(
-        label: String,
-        bgColor: Int,
-        borderColor: Int = bgColor,
-        textColor: Int = textPrimary
-    ): Button = Button(this).apply {
-        text = label
-        textSize = 14f
-        typeface = Typeface.DEFAULT_BOLD
-        isAllCaps = false
-        setTextColor(textColor)
-        setPadding(dp(14), dp(12), dp(14), dp(12))
-        background = createRoundedDrawable(bgColor, borderColor, dp(12))
-    }
-
-    private fun createRoundedDrawable(fillColor: Int, strokeColor: Int, radiusPx: Int): GradientDrawable =
-        GradientDrawable().apply {
-            shape = GradientDrawable.RECTANGLE
-            cornerRadius = radiusPx.toFloat()
-            setColor(fillColor)
-            setStroke(dp(1), strokeColor)
-        }
-
-    private fun createCircleDrawable(fillColor: Int, strokeColor: Int): GradientDrawable =
-        GradientDrawable().apply {
-            shape = GradientDrawable.OVAL
-            setColor(fillColor)
-            setStroke(dp(2), strokeColor)
-        }
-
-    private fun dp(value: Int): Int = (value * resources.displayMetrics.density).toInt()
 }
