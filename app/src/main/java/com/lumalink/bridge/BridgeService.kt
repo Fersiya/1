@@ -256,6 +256,18 @@ class BridgeService : Service() {
                 bleConnectedOnce = true
                 updateStatus("Bluetooth подключён, согласование MTU...")
                 refreshGattCache(gatt)
+                // Короткий интервал соединения (~7–15 мс вместо 30–50 мс): быстрее запись и отклик лампы.
+                try {
+                    gatt.requestConnectionPriority(BluetoothGatt.CONNECTION_PRIORITY_HIGH)
+                } catch (_: Exception) {}
+                // PHY 2M удваивает скорость радиоканала; если не поддерживается — Android оставит 1M.
+                try {
+                    gatt.setPreferredPhy(
+                        BluetoothDevice.PHY_LE_2M_MASK,
+                        BluetoothDevice.PHY_LE_2M_MASK,
+                        BluetoothDevice.PHY_OPTION_NO_PREFERRED
+                    )
+                } catch (_: Exception) {}
                 scope.launch {
                     delay(200)
                     if (!stopping) {
